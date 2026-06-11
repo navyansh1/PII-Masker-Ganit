@@ -48,19 +48,9 @@ body {
 .brand-logo { height: 34px; }
 .brand-divider { width: 1px; height: 26px; background: var(--tint-2); }
 .brand-product {
-  display: flex; align-items: center; gap: 7px;
-  font-weight: 600; font-size: 1.1rem; color: var(--blue);
+  font-weight: 600; font-size: 1.2rem; color: var(--blue);
+  letter-spacing: -0.01em;
 }
-.header-link {
-  font-size: 0.82rem; color: var(--grey); text-decoration: none;
-  border: 1px solid var(--tint); padding: 6px 12px; border-radius: 999px;
-  transition: all .2s;
-}
-.header-link:hover { color: var(--blue); border-color: var(--blue); }
-
-/* ---------------- Unicorn mark ---------------- */
-.unicorn { width: 22px; height: 22px; color: var(--orange); }
-.unicorn-lg { width: 56px; height: 56px; margin-bottom: 6px; }
 
 /* ---------------- Layout ---------------- */
 .wrap { max-width: 1080px; margin: 0 auto; padding: 40px 24px 80px; }
@@ -104,10 +94,8 @@ body {
 }
 .btn-primary:hover { background: var(--blue-deep); transform: translateY(-1px); }
 .btn-primary:active { transform: translateY(0); }
-.btn-primary .unicorn { color: #fff; }
 .btn-go { margin-top: 18px; background: var(--orange); box-shadow: 0 6px 16px rgba(254, 110, 6, 0.3); }
 .btn-go:hover { background: #e85f00; }
-.btn-go .unicorn { color: #fff; }
 
 /* ---------------- Status / spinner ---------------- */
 .status { text-align: center; margin-top: 24px; }
