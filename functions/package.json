@@ -1,0 +1,23 @@
+{
+  "name": "masker-functions",
+  "description": "Masker by Ganit - PII redaction API powered by Gemini 2.5 Flash-Lite",
+  "main": "index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": "20"
+  },
+  "scripts": {
+    "serve": "firebase emulators:start --only functions,hosting",
+    "deploy": "firebase deploy"
+  },
+  "dependencies": {
+    "@google-cloud/vision": "^5.3.7",
+    "@google/generative-ai": "^0.21.0",
+    "@napi-rs/canvas": "^0.1.65",
+    "busboy": "^1.6.0",
+    "firebase-admin": "^12.6.0",
+    "firebase-functions": "^6.1.0",
+    "pdf-lib": "^1.17.1",
+    "pdfjs-dist": "^4.7.76"
+  }
+}

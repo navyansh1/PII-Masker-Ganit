@@ -1,0 +1,11 @@
+{
+  "patient": "Rohan Mehta",
+  "dob": "14/03/1987",
+  "mrn": "MRN-558213",
+  "aadhaar": "4729 8841 2096",
+  "phone": "+91 98201 55432",
+  "email": "rohan.mehta@example.com",
+  "address": "27 Marine Lines, Mumbai 400020",
+  "doctor": "Dr. Anita Kulkarni",
+  "policy": "INS-PL-7741209"
+}
