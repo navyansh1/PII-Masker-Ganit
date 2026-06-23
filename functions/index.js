@@ -28,6 +28,45 @@ const { createRequire } = require("module");
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
 const MODEL = "gemini-2.5-flash-lite";
 const PDF_RENDER_SCALE = 2.0;
+const PAGE_CONCURRENCY = 4;   // pages classified in parallel (bounded)
+const MAX_RETRIES = 4;        // retries per Gemini call on transient errors
+
+// Run an async task with exponential backoff + jitter on transient Gemini
+// failures (503 overloaded / 429 rate-limit / network blips). Non-transient
+// errors are re-thrown immediately.
+async function withRetry(fn, label) {
+  let lastErr;
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const msg = String(err && err.message);
+      const transient = /\b(429|500|502|503|504)\b/.test(msg) ||
+        /overloaded|high demand|unavailable|deadline|ECONNRESET|ETIMEDOUT|fetch failed/i.test(msg);
+      if (!transient || attempt === MAX_RETRIES) throw err;
+      const delay = Math.min(8000, 500 * 2 ** attempt) + Math.floor(Math.random() * 400);
+      console.warn(`[retry] ${label} attempt ${attempt + 1} failed (${msg.slice(0, 120)}); retrying in ${delay}ms`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+  throw lastErr;
+}
+
+// Map over items with a bounded number running concurrently. Results keep
+// input order. Throws if any task throws (after its own retries are exhausted).
+async function mapConcurrent(items, limit, worker) {
+  const results = new Array(items.length);
+  let next = 0;
+  async function run() {
+    while (next < items.length) {
+      const i = next++;
+      results[i] = await worker(items[i], i);
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, run));
+  return results;
+}
 
 // Vision client authenticates automatically via the function's service account.
 const visionClient = new vision.ImageAnnotatorClient();
@@ -88,7 +127,10 @@ function parseUpload(req) {
 // OCR a page PNG with Vision -> [{ text, box:{x,y,w,h} }] in pixel coords.
 // ---------------------------------------------------------------------------
 async function ocrWords(pngBuffer) {
-  const [result] = await visionClient.documentTextDetection({ image: { content: pngBuffer } });
+  const [result] = await withRetry(
+    () => visionClient.documentTextDetection({ image: { content: pngBuffer } }),
+    "vision-ocr"
+  );
   const ann = result.fullTextAnnotation;
   const words = [];
   if (!ann) return words;
@@ -115,7 +157,7 @@ async function ocrWords(pngBuffer) {
 async function classifyPII(genAI, words) {
   if (words.length === 0) return new Map();
   const model = genAI.getGenerativeModel({ model: MODEL });
-  const result = await model.generateContent(buildPrompt(words));
+  const result = await withRetry(() => model.generateContent(buildPrompt(words)), "gemini-classify");
   let text = result.response.text().trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
   const map = new Map();
   try {
@@ -217,9 +259,13 @@ exports.redact = onRequest(
 
       if (isPdf) {
         const pagePngs = await renderPdfPages(buffer);
+        // Classify pages concurrently (bounded); each call retries on transient
+        // Gemini/Vision errors so one hiccup no longer fails the whole document.
+        const processed = await mapConcurrent(pagePngs, PAGE_CONCURRENCY, (png) => processPage(genAI, png));
+        // Assemble in original page order.
         const outPdf = await PDFDocument.create();
-        for (let i = 0; i < pagePngs.length; i++) {
-          const { pngBuffer, width, height, items } = await processPage(genAI, pagePngs[i]);
+        for (let i = 0; i < processed.length; i++) {
+          const { pngBuffer, width, height, items } = processed[i];
           const png = await outPdf.embedPng(pngBuffer);
           const pg = outPdf.addPage([width, height]);
           pg.drawImage(png, { x: 0, y: 0, width, height });
@@ -229,7 +275,7 @@ exports.redact = onRequest(
         const outBytes = await outPdf.save();
         res.set("Content-Type", "application/pdf");
         res.set("Content-Disposition", `attachment; filename="redacted-${safe(filename)}"`);
-        res.set("X-Masker-Report", JSON.stringify(report));
+        res.set("X-Masker-Report", headerSafeJson(report));
         return res.status(200).send(Buffer.from(outBytes));
       } else {
         const { pngBuffer, items } = await processPage(genAI, buffer);
@@ -238,7 +284,7 @@ exports.redact = onRequest(
         const outName = safe(filename).replace(/\.(jpe?g|webp|gif|bmp)$/i, ".png");
         res.set("Content-Type", "image/png");
         res.set("Content-Disposition", `attachment; filename="redacted-${outName}"`);
-        res.set("X-Masker-Report", JSON.stringify(report));
+        res.set("X-Masker-Report", headerSafeJson(report));
         return res.status(200).send(pngBuffer);
       }
     } catch (err) {
@@ -255,3 +301,10 @@ function summarise(it) {
   return { type: it.type || "PII", preview: masked };
 }
 function safe(name) { return (name || "file").replace(/[^a-zA-Z0-9._-]/g, "_"); }
+
+// HTTP header values must be ASCII (no newlines/control/non-Latin1 chars).
+// OCR'd PII previews can contain Devanagari, accents, etc. — strip them so the
+// X-Masker-Report header never crashes the response after the work is done.
+function headerSafeJson(obj) {
+  return JSON.stringify(obj).replace(/[^\x20-\x7E]/g, "?");
+}
