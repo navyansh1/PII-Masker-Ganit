@@ -97,6 +97,17 @@ async function runRedaction() {
     renderRedacted(blob);
     renderReport(report);
 
+    // Google's Gemini API was fully down for this run, so the server fell back
+    // to the rule-based (regex) detector. Warn the user that this pass is less
+    // accurate and they may want to re-run once the AI service recovers.
+    if (report && report.engine === "regex") {
+      showToast(
+        "⚠ Google AI was unavailable — used basic rule-based redaction instead. " +
+        "This is less accurate; please review the output and re-run later for AI-grade redaction.",
+        "warn"
+      );
+    }
+
     els.statusCard.classList.add("hidden");
     els.results.classList.remove("hidden");
     els.results.scrollIntoView({ behavior: "smooth", block: "start" });
@@ -198,6 +209,42 @@ function renderReport(report) {
     });
   });
   els.reportCard.classList.toggle("hidden", !any);
+}
+
+/* ---------------- Toast / popup ---------------- */
+// Self-contained popup notice. Injects its own styles once so no HTML/CSS
+// changes are needed. `kind` controls the accent colour ("warn" | "info").
+function showToast(message, kind) {
+  if (!document.getElementById("masker-toast-style")) {
+    const style = document.createElement("style");
+    style.id = "masker-toast-style";
+    style.textContent =
+      ".masker-toast{position:fixed;top:20px;left:50%;transform:translateX(-50%) translateY(-20px);" +
+      "max-width:560px;width:calc(100% - 32px);z-index:9999;padding:14px 44px 14px 16px;border-radius:10px;" +
+      "font:500 14px/1.45 system-ui,sans-serif;color:#3a2a00;background:#fff6e0;border:1px solid #f0c64c;" +
+      "box-shadow:0 8px 28px rgba(0,0,0,.18);opacity:0;transition:opacity .25s,transform .25s;}" +
+      ".masker-toast.info{color:#0b2a4a;background:#e8f1ff;border-color:#7fb0f0;}" +
+      ".masker-toast.show{opacity:1;transform:translateX(-50%) translateY(0);}" +
+      ".masker-toast button{position:absolute;top:8px;right:10px;border:0;background:none;cursor:pointer;" +
+      "font-size:18px;line-height:1;color:inherit;opacity:.6;}.masker-toast button:hover{opacity:1;}";
+    document.head.appendChild(style);
+  }
+  const toast = document.createElement("div");
+  toast.className = "masker-toast" + (kind === "info" ? " info" : "");
+  toast.setAttribute("role", "alert");
+  toast.textContent = message;
+  const close = document.createElement("button");
+  close.setAttribute("aria-label", "Dismiss");
+  close.textContent = "×";
+  const dismiss = () => {
+    toast.classList.remove("show");
+    setTimeout(() => toast.remove(), 250);
+  };
+  close.addEventListener("click", dismiss);
+  toast.appendChild(close);
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add("show"));
+  setTimeout(dismiss, 12000); // auto-dismiss after 12s
 }
 
 /* ---------------- Download ---------------- */

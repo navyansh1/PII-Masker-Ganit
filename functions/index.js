@@ -26,10 +26,25 @@ const path = require("path");
 const { createRequire } = require("module");
 
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
-const MODEL = "gemini-2.5-flash-lite";
+// Models tried in order. When the primary keeps returning 503 ("high demand")
+// after its retries are exhausted, we fall back to the next model so the run
+// completes instead of failing the whole document.
+const MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"];
 const PDF_RENDER_SCALE = 2.0;
 const PAGE_CONCURRENCY = 4;   // pages classified in parallel (bounded)
-const MAX_RETRIES = 4;        // retries per Gemini call on transient errors
+// Keep total retry time bounded: with 2 models, this is at most
+// 2 retries * 2 models per page. Long retry storms used to blow the gateway
+// timeout and surface as a 502 to the browser, so we fail over to the regex
+// fallback faster instead of hanging.
+const MAX_RETRIES = 2;        // retries per Gemini call on transient errors
+
+// True for errors worth retrying / falling back on: 5xx/429 from the API,
+// "high demand" overload messages, and transient network blips.
+function isTransient(err) {
+  const msg = String(err && err.message);
+  return /\b(429|500|502|503|504)\b/.test(msg) ||
+    /overloaded|high demand|unavailable|deadline|ECONNRESET|ETIMEDOUT|fetch failed/i.test(msg);
+}
 
 // Run an async task with exponential backoff + jitter on transient Gemini
 // failures (503 overloaded / 429 rate-limit / network blips). Non-transient
@@ -42,9 +57,7 @@ async function withRetry(fn, label) {
     } catch (err) {
       lastErr = err;
       const msg = String(err && err.message);
-      const transient = /\b(429|500|502|503|504)\b/.test(msg) ||
-        /overloaded|high demand|unavailable|deadline|ECONNRESET|ETIMEDOUT|fetch failed/i.test(msg);
-      if (!transient || attempt === MAX_RETRIES) throw err;
+      if (!isTransient(err) || attempt === MAX_RETRIES) throw err;
       const delay = Math.min(8000, 500 * 2 ** attempt) + Math.floor(Math.random() * 400);
       console.warn(`[retry] ${label} attempt ${attempt + 1} failed (${msg.slice(0, 120)}); retrying in ${delay}ms`);
       await new Promise((r) => setTimeout(r, delay));
@@ -103,6 +116,52 @@ ${numbered}`;
 }
 
 // ---------------------------------------------------------------------------
+// Rule-based PII detector. Last-resort fallback for when EVERY Gemini model is
+// down (Google capacity spike). Far less precise than the LLM, but guarantees
+// the document still gets redacted rather than failing. Errs toward
+// over-redaction: anything that looks like a number/id/contact is masked.
+// Returns Map<index, type>.
+// ---------------------------------------------------------------------------
+const LABEL_WORDS = new Set([
+  "patient", "name", "doctor", "dr", "mr", "mrs", "ms", "date", "of", "birth",
+  "dob", "address", "phone", "tel", "fax", "email", "e-mail", "mrn", "id",
+  "age", "sex", "gender", "insurance", "policy", "ward", "bed", "room",
+  "hospital", "report", "summary", "discharge", "admission", "department",
+]);
+const RE_EMAIL = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/;
+const RE_PHONE = /^\+?\(?\d[\d\s().-]{6,}$/;          // 7+ digits, phone-ish
+const RE_ID = /^[A-Za-z]{0,4}[-:#]?\d{3,}[-\dA-Za-z]*$/; // MRN-12345, INS-PL-9, 558213
+const RE_IDPREFIX = /^(MRN|INS|PL|ID|UHID|SSN|AADHAAR|ACC|REF|POLICY)[-:#]?$/i;
+const RE_DATE = /^\d{1,4}[/\-.]\d{1,2}([/\-.]\d{1,4})?$/; // 12/03/1980, 1980-03-12
+const RE_CAPNAME = /^[A-Z][a-z]{1,}$/;                 // Capitalised word (name-ish)
+
+function classifyPIIRegex(words) {
+  const map = new Map();
+  for (let i = 0; i < words.length; i++) {
+    const raw = (words[i].text || "").trim();
+    if (!raw) continue;
+    const lower = raw.toLowerCase().replace(/[:.]$/, "");
+    if (LABEL_WORDS.has(lower)) continue; // never redact a field label itself
+
+    let type = null;
+    if (RE_EMAIL.test(raw)) type = "email";
+    else if (RE_IDPREFIX.test(raw)) type = "id";
+    else if (RE_DATE.test(raw)) type = "date";
+    else if (RE_PHONE.test(raw) && (raw.replace(/\D/g, "").length >= 7)) type = "phone";
+    else if (RE_ID.test(raw) && /\d/.test(raw)) type = "id";
+    else if (RE_CAPNAME.test(raw)) {
+      // A capitalised word right after a name/doctor label is very likely a name.
+      const prev = (words[i - 1]?.text || "").toLowerCase().replace(/[:.]$/, "");
+      const prev2 = (words[i - 2]?.text || "").toLowerCase().replace(/[:.]$/, "");
+      if (["name", "patient", "doctor", "dr", "mr", "mrs", "ms"].includes(prev) ||
+          ["name", "patient", "doctor"].includes(prev2)) type = "name";
+    }
+    if (type) map.set(i, type);
+  }
+  return map;
+}
+
+// ---------------------------------------------------------------------------
 // Parse a multipart/form-data upload into { buffer, filename, mimeType }.
 // ---------------------------------------------------------------------------
 function parseUpload(req) {
@@ -155,9 +214,34 @@ async function ocrWords(pngBuffer) {
 // Ask Gemini which word indices are PII.  Returns Map<index, type>.
 // ---------------------------------------------------------------------------
 async function classifyPII(genAI, words) {
-  if (words.length === 0) return new Map();
-  const model = genAI.getGenerativeModel({ model: MODEL });
-  const result = await withRetry(() => model.generateContent(buildPrompt(words)), "gemini-classify");
+  if (words.length === 0) return { map: new Map(), engine: "gemini" };
+  const prompt = buildPrompt(words);
+  // Try each model in order. withRetry handles short-lived spikes within a
+  // model; if a model is still 503-ing after all retries, fall back to the
+  // next one. If EVERY model is down (Google-wide spike), fall back to the
+  // rule-based detector so the document is still redacted rather than failing.
+  let result, lastErr;
+  for (let m = 0; m < MODELS.length; m++) {
+    const name = MODELS[m];
+    try {
+      const model = genAI.getGenerativeModel({ model: name });
+      result = await withRetry(() => model.generateContent(prompt), `gemini-classify:${name}`);
+      if (m > 0) console.warn(`[fallback] classified with ${name} after ${MODELS[m - 1]} was unavailable`);
+      break;
+    } catch (err) {
+      lastErr = err;
+      if (isTransient(err) && m < MODELS.length - 1) {
+        console.warn(`[fallback] ${name} unavailable (${String(err.message).slice(0, 120)}); trying ${MODELS[m + 1]}`);
+        continue;
+      }
+      if (isTransient(err)) break; // all models exhausted -> regex fallback below
+      throw err;                   // non-transient (bad key, bad request) -> real error
+    }
+  }
+  if (!result) {
+    console.warn(`[fallback] all Gemini models unavailable (${String(lastErr && lastErr.message).slice(0, 120)}); using regex detector`);
+    return { map: classifyPIIRegex(words), engine: "regex" };
+  }
   let text = result.response.text().trim().replace(/^```(?:json)?/i, "").replace(/```$/, "").trim();
   const map = new Map();
   try {
@@ -168,14 +252,14 @@ async function classifyPII(genAI, words) {
       }
     }
   } catch { /* leave map empty on parse failure */ }
-  return map;
+  return { map, engine: "gemini" };
 }
 
 // ---------------------------------------------------------------------------
 // Black out the OCR boxes of the flagged words on a page image.
 // Returns { pngBuffer, width, height, items:[{type, text}] }.
 // ---------------------------------------------------------------------------
-async function redactPage(pngBuffer, words, piiMap) {
+async function redactPage(pngBuffer, words, piiMap, engine) {
   const img = await loadImage(pngBuffer);
   const canvas = createCanvas(img.width, img.height);
   const ctx = canvas.getContext("2d");
@@ -190,14 +274,14 @@ async function redactPage(pngBuffer, words, piiMap) {
     ctx.fillRect(x - pad, y - pad, bw + pad * 2, bh + pad * 2);
     items.push({ type, text: w.text });
   }
-  return { pngBuffer: canvas.toBuffer("image/png"), width: img.width, height: img.height, items };
+  return { pngBuffer: canvas.toBuffer("image/png"), width: img.width, height: img.height, items, engine };
 }
 
 // Process one page: OCR -> classify -> redact.
 async function processPage(genAI, pngBuffer) {
   const words = await ocrWords(pngBuffer);
-  const piiMap = await classifyPII(genAI, words);
-  return redactPage(pngBuffer, words, piiMap);
+  const { map, engine } = await classifyPII(genAI, words);
+  return redactPage(pngBuffer, words, map, engine);
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +339,10 @@ exports.redact = onRequest(
       const { buffer, filename, mimeType } = await parseUpload(req);
       const genAI = new GoogleGenerativeAI(GEMINI_API_KEY.value());
       const isPdf = mimeType === "application/pdf" || /\.pdf$/i.test(filename);
-      const report = { pages: [], totalRedactions: 0 };
+      // engine: "gemini" normally, "regex" if every model was down and we fell
+      // back to the rule-based detector for any page. The UI reads this to warn
+      // the user that AI redaction was unavailable.
+      const report = { pages: [], totalRedactions: 0, engine: "gemini" };
 
       if (isPdf) {
         const pagePngs = await renderPdfPages(buffer);
@@ -265,7 +352,8 @@ exports.redact = onRequest(
         // Assemble in original page order.
         const outPdf = await PDFDocument.create();
         for (let i = 0; i < processed.length; i++) {
-          const { pngBuffer, width, height, items } = processed[i];
+          const { pngBuffer, width, height, items, engine } = processed[i];
+          if (engine === "regex") report.engine = "regex";
           const png = await outPdf.embedPng(pngBuffer);
           const pg = outPdf.addPage([width, height]);
           pg.drawImage(png, { x: 0, y: 0, width, height });
@@ -278,7 +366,8 @@ exports.redact = onRequest(
         res.set("X-Masker-Report", headerSafeJson(report));
         return res.status(200).send(Buffer.from(outBytes));
       } else {
-        const { pngBuffer, items } = await processPage(genAI, buffer);
+        const { pngBuffer, items, engine } = await processPage(genAI, buffer);
+        if (engine === "regex") report.engine = "regex";
         report.pages.push({ page: 1, redactions: items.length, items: items.map(summarise) });
         report.totalRedactions += items.length;
         const outName = safe(filename).replace(/\.(jpe?g|webp|gif|bmp)$/i, ".png");
