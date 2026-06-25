@@ -78,6 +78,9 @@ async function runRedaction() {
 
   try {
     const form = new FormData();
+    // Append mode first so Busboy sees the field before the file stream.
+    const mode = (document.querySelector('input[name="mode"]:checked') || {}).value || "full";
+    form.append("mode", mode);
     form.append("file", selectedFile, selectedFile.name);
 
     const resp = await fetch(REDACT_ENDPOINT, { method: "POST", body: form });

@@ -86,9 +86,31 @@ const visionClient = new vision.ImageAnnotatorClient();
 
 // ---------------------------------------------------------------------------
 // Prompt: Gemini classifies which numbered words are PII. No coordinates.
+// `mode` selects how much to redact:
+//   "full"    (default) - all PII/PHI categories below.
+//   "id-name"            - ONLY the patient id value and the patient name.
 // ---------------------------------------------------------------------------
-function buildPrompt(words) {
+function buildPrompt(words, mode) {
   const numbered = words.map((w, i) => `${i}: ${w.text}`).join("\n");
+
+  if (mode === "id-name") {
+    return `You are a medical-document privacy expert. Below is a numbered list of every word read from one page of a medical document, in reading order.
+
+Redact ONLY these three things, and NOTHING else:
+- The PATIENT ID value - the identifier next to a label like "Patient Id", "Patient ID", "MRN", "UHID", "Reg No", "Patient No". Flag every token of the value, including any prefix OCR split off (e.g. "MMD3180157", or "MRN-" + "558213" = both tokens).
+- The PATIENT NAME value - every name token of the patient (first/middle/last), but NOT a "Dr"/"Mr"/"Mrs"/"Ms" title word on its own.
+- The AADHAAR number - the 12-digit Indian national ID, usually shown as three 4-digit groups (e.g. "4729 8841 2096" = all three tokens) or as one 12-digit block. Flag every token of it, including any "Aadhaar"/"UID" value that is a number. Do NOT flag the label word "Aadhaar"/"UID" itself.
+
+Do NOT redact anything else: not the field labels themselves ("Patient", "Patient Id", "Name", "Aadhaar", etc.), not dates, not age/sex, not doctor names, not addresses, phones, emails, encounter/voucher/account/policy numbers, amounts, diagnoses, or any other text. ONLY the patient id value, the patient name value, and the Aadhaar number.
+
+Return ONLY valid JSON, no markdown, in exactly this shape:
+{ "pii": [ { "index": <number>, "type": "<patient_id|patient_name|aadhaar>" } ] }
+Include one entry per flagged word index. If none, return { "pii": [] }.
+
+WORDS:
+${numbered}`;
+  }
+
   return `You are a medical-document privacy expert. Below is a numbered list of every word read from one page of a medical document, in reading order.
 
 Identify which words are Personally Identifiable Information (PII) or Protected Health Information (PHI) that must be redacted. Include:
@@ -168,6 +190,8 @@ function parseUpload(req) {
   return new Promise((resolve, reject) => {
     const bb = Busboy({ headers: req.headers, limits: { fileSize: 25 * 1024 * 1024 } });
     let fileBuffer = null, filename = "upload", mimeType = "application/octet-stream";
+    let mode = "full";
+    bb.on("field", (name, val) => { if (name === "mode") mode = val; });
     bb.on("file", (_n, stream, info) => {
       filename = info.filename || filename;
       mimeType = info.mimeType || mimeType;
@@ -176,7 +200,7 @@ function parseUpload(req) {
       stream.on("limit", () => reject(new Error("File too large (max 25 MB).")));
       stream.on("end", () => (fileBuffer = Buffer.concat(chunks)));
     });
-    bb.on("close", () => fileBuffer ? resolve({ buffer: fileBuffer, filename, mimeType }) : reject(new Error("No file received.")));
+    bb.on("close", () => fileBuffer ? resolve({ buffer: fileBuffer, filename, mimeType, mode }) : reject(new Error("No file received.")));
     bb.on("error", reject);
     bb.end(req.rawBody);
   });
@@ -213,9 +237,9 @@ async function ocrWords(pngBuffer) {
 // ---------------------------------------------------------------------------
 // Ask Gemini which word indices are PII.  Returns Map<index, type>.
 // ---------------------------------------------------------------------------
-async function classifyPII(genAI, words) {
+async function classifyPII(genAI, words, mode) {
   if (words.length === 0) return { map: new Map(), engine: "gemini" };
-  const prompt = buildPrompt(words);
+  const prompt = buildPrompt(words, mode);
   // Try each model in order. withRetry handles short-lived spikes within a
   // model; if a model is still 503-ing after all retries, fall back to the
   // next one. If EVERY model is down (Google-wide spike), fall back to the
@@ -239,6 +263,12 @@ async function classifyPII(genAI, words) {
     }
   }
   if (!result) {
+    // id-name mode needs the LLM to tell apart the patient id/name from every
+    // other id, date, doctor, etc. The blunt regex detector can't do that
+    // without over-redacting, so we surface a real error instead of guessing.
+    if (mode === "id-name") {
+      throw new Error("AI service is temporarily unavailable. Please try again shortly.");
+    }
     console.warn(`[fallback] all Gemini models unavailable (${String(lastErr && lastErr.message).slice(0, 120)}); using regex detector`);
     return { map: classifyPIIRegex(words), engine: "regex" };
   }
@@ -278,9 +308,9 @@ async function redactPage(pngBuffer, words, piiMap, engine) {
 }
 
 // Process one page: OCR -> classify -> redact.
-async function processPage(genAI, pngBuffer) {
+async function processPage(genAI, pngBuffer, mode) {
   const words = await ocrWords(pngBuffer);
-  const { map, engine } = await classifyPII(genAI, words);
+  const { map, engine } = await classifyPII(genAI, words, mode);
   return redactPage(pngBuffer, words, map, engine);
 }
 
@@ -336,19 +366,21 @@ exports.redact = onRequest(
     res.set("Access-Control-Expose-Headers", "X-Masker-Report, Content-Disposition");
 
     try {
-      const { buffer, filename, mimeType } = await parseUpload(req);
+      const { buffer, filename, mimeType, mode } = await parseUpload(req);
+      // Only two modes are valid; anything else falls back to full redaction.
+      const redactMode = mode === "id-name" ? "id-name" : "full";
       const genAI = new GoogleGenerativeAI(GEMINI_API_KEY.value());
       const isPdf = mimeType === "application/pdf" || /\.pdf$/i.test(filename);
       // engine: "gemini" normally, "regex" if every model was down and we fell
       // back to the rule-based detector for any page. The UI reads this to warn
       // the user that AI redaction was unavailable.
-      const report = { pages: [], totalRedactions: 0, engine: "gemini" };
+      const report = { pages: [], totalRedactions: 0, engine: "gemini", mode: redactMode };
 
       if (isPdf) {
         const pagePngs = await renderPdfPages(buffer);
         // Classify pages concurrently (bounded); each call retries on transient
         // Gemini/Vision errors so one hiccup no longer fails the whole document.
-        const processed = await mapConcurrent(pagePngs, PAGE_CONCURRENCY, (png) => processPage(genAI, png));
+        const processed = await mapConcurrent(pagePngs, PAGE_CONCURRENCY, (png) => processPage(genAI, png, redactMode));
         // Assemble in original page order.
         const outPdf = await PDFDocument.create();
         for (let i = 0; i < processed.length; i++) {
@@ -366,7 +398,7 @@ exports.redact = onRequest(
         res.set("X-Masker-Report", headerSafeJson(report));
         return res.status(200).send(Buffer.from(outBytes));
       } else {
-        const { pngBuffer, items, engine } = await processPage(genAI, buffer);
+        const { pngBuffer, items, engine } = await processPage(genAI, buffer, redactMode);
         if (engine === "regex") report.engine = "regex";
         report.pages.push({ page: 1, redactions: items.length, items: items.map(summarise) });
         report.totalRedactions += items.length;

@@ -35,6 +35,19 @@
       <input type="file" id="fileInput" accept="image/*,application/pdf" hidden />
       <button class="btn-primary" id="browseBtn" type="button">Choose file</button>
       <p class="filename" id="fileName"></p>
+
+      <fieldset class="mode-select" id="modeSelect">
+        <legend>What to redact</legend>
+        <label>
+          <input type="radio" name="mode" value="full" checked />
+          <span>All PII / PHI <small>names, IDs, dates, contacts, addresses&hellip;</small></span>
+        </label>
+        <label>
+          <input type="radio" name="mode" value="id-name" />
+          <span>Patient ID, Name &amp; Aadhaar only <small>blacks out just those three fields</small></span>
+        </label>
+      </fieldset>
+
       <button class="btn-primary btn-go hidden" id="redactBtn" type="button">Redact PII</button>
     </section>
 
